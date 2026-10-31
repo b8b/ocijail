@@ -1,0 +1,36 @@
+# A podman that can run containers inside itself.
+#
+# ocijail is not built here: an image build needs a working runtime for its RUN
+# steps, so examples/nested-podman/build.sh builds the patched runtime first and
+# leaves it next to this file. A plain `podman build` only works once that
+# binary exists.
+#
+#   ./examples/nested-podman/build.sh                # bootstraps, then builds this
+#   podman build -f examples/nested-podman/Containerfile \
+#       -t podman examples/nested-podman             # rebuild, binary present
+#
+ARG BASE_IMAGE=ghcr.io/freebsd/freebsd-runtime:15.1
+FROM ${BASE_IMAGE}
+
+# podman pulls in ocijail (replaced below), conmon, the CNI plugins and
+# containers-common. The packaged ocijail is only needed to satisfy the
+# dependency, its binary is overwritten.
+RUN pkg install -y FreeBSD-utilities FreeBSD-pf podman && pkg clean -y
+
+ADD ocijail /usr/local/bin/ocijail
+
+# vfs storage and the annotations that let the containers created from inside
+# this one get their own vnet and mount file systems.
+ADD storage.conf /usr/local/etc/containers/storage.conf
+ADD containers.conf /usr/local/etc/containers/containers.conf
+
+# CNI configuration and the pf rules referenced by ipMasq networks live in
+# /usr/local/etc/cni/net.d; the default network itself is described in
+# containers.conf (default_subnet) and created on first use.
+RUN mkdir -p /usr/local/etc/cni/net.d /var/db/containers/storage
+
+ADD entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["/bin/sh"]

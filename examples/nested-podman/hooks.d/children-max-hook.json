@@ -1,0 +1,21 @@
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "/bin/sh",
+    "args": [
+      "-c",
+      "state=$(cat); limit=$(printf '%s' \"$state\" | jq -r '.annotations[\"org.freebsd.jail.children.max\"] // empty'); [ -n \"$limit\" ] || exit 0; jid=$(printf '%s' \"$state\" | jq -r '.annotations[\"org.freebsd.jail.jid\"]'); exec jail -m jid=\"$jid\" children.max=\"$limit\""
+    ],
+    "env": [
+      "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    ]
+  },
+  "when": {
+    "annotations": {
+      "org.freebsd.jail.children.max": ".+"
+    }
+  },
+  "stages": [
+    "createRuntime"
+  ]
+}
