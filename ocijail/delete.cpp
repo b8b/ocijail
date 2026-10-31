@@ -5,6 +5,7 @@
 
 #include "nlohmann/json.hpp"
 
+#include "cleanup.h"
 #include "delete.h"
 #include "hook.h"
 #include "jail.h"
@@ -68,6 +69,8 @@ void delete_::run() {
            << state["status"] << ")";
         throw std::runtime_error(ss.str());
     }
+
+    cleanup_jail(app_, int(state["jid"]));
 
     auto j = jail::find(int(state["jid"]));
     j.remove();

@@ -7,6 +7,8 @@ cc_binary(
         "-lm",
     ],
     srcs = [
+        "cleanup.cpp",
+        "cleanup.h",
         "create.cpp",
         "create.h",
         "delete.cpp",
