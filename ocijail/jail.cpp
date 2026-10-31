@@ -33,12 +33,12 @@ void jail::config::set(const std::string& key, const value& val) {
 }
 
 jail jail::create(config& jconf) {
-    std::array<char, 1024> errbuf;
+    std::array<char, 1024> errbuf{};
     auto jiov = get_iovec(jconf, errbuf);
     int32_t jid = jail_set(&jiov[0], jiov.size(), JAIL_CREATE);
     if (jid < 0) {
         throw std::system_error{
-            errno, std::system_category(), "error calling jail_set: " + get_errmsg(jiov)};
+            errno, std::system_category(), error_message("error calling jail_set", jiov)};
     }
     return jail{jid};
 }
@@ -46,12 +46,12 @@ jail jail::create(config& jconf) {
 jail jail::find(const std::string& name) {
     config jconf;
     jconf.set("name", name);
-    std::array<char, 1024> errbuf;
+    std::array<char, 1024> errbuf{};
     auto jiov = get_iovec(jconf, errbuf);
     int32_t jid = jail_get(&jiov[0], jiov.size(), 0);
     if (jid < 0) {
         throw std::system_error{
-            errno, std::system_category(), "error calling jail_get: " + get_errmsg(jiov)};
+            errno, std::system_category(), error_message("error calling jail_get", jiov)};
     }
     return jail{jid};
 }
@@ -74,21 +74,28 @@ void jail::remove() {
 }
 
 void jail::_get(config& jconf) {
-    std::array<char, 1024> errbuf;
+    std::array<char, 1024> errbuf{};
     auto jiov = get_iovec(jconf, errbuf);
     if (jail_get(&jiov[0], jiov.size(), 0) < 0) {
         throw std::system_error{
-            errno, std::system_category(), "error calling jail_get: " + get_errmsg(jiov)};
+            errno, std::system_category(), error_message("error calling jail_get", jiov)};
     }
 }
 
 void jail::_set(config& jconf) {
-    std::array<char, 1024> errbuf;
+    std::array<char, 1024> errbuf{};
     auto jiov = get_iovec(jconf, errbuf);
     if (jail_set(&jiov[0], jiov.size(), JAIL_UPDATE) < 0) {
         throw std::system_error{
-            errno, std::system_category(), "error calling jail_set: " + get_errmsg(jiov)};
+            errno, std::system_category(), error_message("error calling jail_set", jiov)};
     }
+}
+
+std::string jail::error_message(const char* what,
+                                const std::vector<iovec>& jiov) {
+    auto msg = get_errmsg(jiov);
+    return msg.empty() ? std::string{what}
+                       : std::string{what} + ": " + msg;
 }
 
 static iovec string_to_iovec(const char *s) {

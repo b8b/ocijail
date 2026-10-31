@@ -6,6 +6,7 @@
 #include <map>
 #include <map>
 #include <variant>
+#include <vector>
 
 namespace ocijail {
 
@@ -68,6 +69,8 @@ struct jail {
         auto msg = reinterpret_cast<const char*>(err.iov_base);
         return std::string{msg, strnlen(msg, 1024)};
     }
+    static std::string error_message(const char* what,
+                                     const std::vector<iovec>& jiov);
 
     int32_t jid_;
 };
