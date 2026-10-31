@@ -89,7 +89,14 @@ void hook::run_hooks(main_app& app,
     }
 
     for (auto& hook_config : hooks[phase]) {
-        hook(hook_config).run(app, state);
+        auto rc = hook(hook_config).run(app, state);
+        if (rc != 0) {
+            // Nothing in the spec says a failing hook is fatal, but it should
+            // not be invisible either.
+            app.log() << phase << " hook "
+                      << hook_config["path"].get<std::string>()
+                      << " exited with status " << rc;
+        }
     }
 }
 
