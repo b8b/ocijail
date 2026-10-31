@@ -6,6 +6,7 @@
 #include "nlohmann/json.hpp"
 
 #include "hook.h"
+#include "mount.h"
 #include "start.h"
 
 namespace fs = std::filesystem;
@@ -37,6 +38,10 @@ void start::run() {
            << state["status"] << ")";
         throw std::runtime_error(ss.str());
     }
+    // Do this before the save below so the recorded save directories are
+    // persisted, and before the container process is released so it sees the
+    // final contents.
+    copy_deferred_file_mounts(app_, state);
     state["status"] = "running";
     state.save();
 

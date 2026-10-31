@@ -10,6 +10,9 @@
 
 namespace ocijail {
 
+// Are we running inside a jail (security.jail.jailed)?
+bool process_is_jailed();
+
 struct jail {
     enum ns : uint32_t {
         DISABLED = 0,

@@ -7,6 +7,7 @@
 #include <iostream>
 #include <optional>
 
+#include "ocijail/jail.h"
 #include "ocijail/main.h"
 #include "ocijail/mount.h"
 
@@ -178,6 +179,74 @@ static std::tuple<fs::path, fs::path> get_save_path(
         destination.parent_path() / (".save-"s + std::string{state.get_id()});
     auto save_path = save_dir / destination.filename();
     return std::make_tuple(save_dir, save_path);
+}
+
+// Emulate a file mount by moving the original out of the way (if it existed)
+// and copying the source in its place. unmount_volume() restores the original.
+// Inside a jail this is the only thing that works: a nullfs file mount made
+// there cannot be unmounted again, because the kernel records its mount point
+// relative to the jail root (see vn_path_to_global_path_hardlink()), so no path
+// in any namespace resolves to it.
+static void emulate_file_mount(runtime_state& state,
+                               const fs::path& destination,
+                               bool destination_exists,
+                               const fs::path& source) {
+    if (destination_exists) {
+        auto [save_dir, save_path] = get_save_path(state, destination);
+        if (!fs::exists(save_dir)) {
+            fs::create_directories(save_dir);
+            state["remove_on_unmount"].push_back(save_dir);
+        }
+        fs::rename(destination, save_path);
+    }
+    fs::copy_file(source, destination, fs::copy_options::overwrite_existing);
+}
+
+// Record a file mount to be emulated when the container is started, and not
+// now: podman and buildah run the runtime as create -> (network setup, which
+// writes /etc/hosts and /etc/resolv.conf) -> start, so at create time those
+// files are still empty. A real mount would pick up the later writes; a copy
+// has to wait until start, which is the last thing that happens before the
+// container process runs.
+static void defer_file_mount(runtime_state& state,
+                             const fs::path& destination,
+                             const fs::path& source,
+                             bool destination_existed) {
+    for (auto& entry : state["deferred_file_mounts"]) {
+        if (entry["destination"] == destination.native()) {
+            return;
+        }
+    }
+    state["deferred_file_mounts"].push_back(
+        json{{"destination", destination.native()},
+             {"source", source.native()},
+             {"destination_existed", destination_existed}});
+}
+
+// Emulate the deferred file mounts. Called from start, before the container
+// process is released.
+void copy_deferred_file_mounts(main_app& app, runtime_state& state) {
+    if (!state.contains("deferred_file_mounts") ||
+        !state["deferred_file_mounts"].is_array()) {
+        return;
+    }
+    for (auto& entry : state["deferred_file_mounts"]) {
+        auto destination = fs::path{entry["destination"].get<std::string>()};
+        auto source = fs::path{entry["source"].get<std::string>()};
+        auto destination_existed =
+            entry["destination_existed"].get<bool>();
+        app.log_debug() << "copying file mount " << destination;
+        emulate_file_mount(
+            state, destination, destination_existed, source);
+    }
+    state["deferred_file_mounts"] = json::array();
+}
+
+static bool file_mounts_recorded(runtime_state& state) {
+    // Set when the file mounts were already recorded in the prepare pass of a
+    // read-only rootfs, where the writable tree still existed.
+    return state.contains("file_mounts_recorded") &&
+           state["file_mounts_recorded"].get<bool>();
 }
 
 static fs::path resolve_container_path_impl(main_app& app,
@@ -384,6 +453,13 @@ static bool mount_volume(main_app& app,
             std::string optstring{opt};
             auto [key, val] = split_option(optstring);
 
+            if (type == "devfs" && process_is_jailed() &&
+                (key == "ruleset" || key == "rule")) {
+                app.log_debug() << "ignoring devfs option \"" << key
+                                << "\" inside a jail";
+                continue;
+            }
+
             auto it = name_to_flag.find(key);
             if (it != name_to_flag.end()) {
                 auto flag = it->second;
@@ -408,6 +484,16 @@ static bool mount_volume(main_app& app,
         create_mount_point(state, root_path, destination, is_file_mount);
 
     if (prepare_only) {
+        // Defer the copy to start, but record it here: this pass has the
+        // writable rootfs, so the destination recorded here stays valid when
+        // start runs against the read-only alias.
+        if (is_file_mount && !file_mount_supported) {
+            app.log_debug() << "deferring file mount "
+                            << mount["destination"].get<std::string>();
+            defer_file_mount(
+                state, destination, mount["source"], destination_exists);
+            state["file_mounts_recorded"] = true;
+        }
         return file_mount_supported;
     }
 
@@ -417,18 +503,12 @@ static bool mount_volume(main_app& app,
 
 retry:
     if (is_file_mount && !file_mount_supported) {
-        // Mimic real file mounts by moving the original to a subdirectory if it
-        // existed and copying the source
-        if (destination_exists) {
-            auto [save_dir, save_path] = get_save_path(state, destination);
-            if (!fs::exists(save_dir)) {
-                fs::create_directories(save_dir);
-                state["remove_on_unmount"].push_back(save_dir);
-            }
-            fs::rename(destination, save_path);
+        if (!file_mounts_recorded(state)) {
+            app.log_debug() << "deferring file mount "
+                            << mount["destination"].get<std::string>();
+            defer_file_mount(
+                state, destination, mount["source"], destination_exists);
         }
-        fs::copy_file(
-            mount["source"], destination, fs::copy_options::overwrite_existing);
     } else {
         // Otherwise perform the actual mount.
         if (do_mount(mount_opts, mount_flags) < 0) {
@@ -471,10 +551,15 @@ static void unmount_volume(main_app& app,
         type == "nullfs" && fs::is_regular_file(mount["source"]);
 
     if (is_file_mount && !file_mount_supported) {
-        // Restore the saved path if it exists
-        auto [_, save_path] = get_save_path(state, destination);
+        // Restore the saved path if it exists. The copy was made through the
+        // writable rootfs, so restore through that path even when a read-only
+        // alias is what the caller is looking at.
+        auto writable_root = fs::path{state["root_path"].get<std::string>()};
+        auto restore_destination =
+            resolve_container_path(app, writable_root, mount);
+        auto [_, save_path] = get_save_path(state, restore_destination);
         if (fs::exists(save_path)) {
-            fs::rename(save_path, destination);
+            fs::rename(save_path, restore_destination);
         }
     } else {
         if (::unmount(destination.c_str(), MNT_FORCE) < 0) {
@@ -510,7 +595,11 @@ void mount_volumes(main_app& app,
                    const fs::path& root_path,
                    bool prepare_only,
                    const json& mounts) {
-    bool file_mount_supported = true;
+    // Inside a jail a nullfs file mount cannot be unmounted again: the kernel
+    // records its mount point relative to the jail root, so no path in any
+    // namespace resolves to it. Never make one there - emulate file mounts by
+    // copying the source into the rootfs instead.
+    bool file_mount_supported = !process_is_jailed();
     std::size_t mounted = 0;
 
     // Publish this before mounting anything. unmount_volumes() reads it back

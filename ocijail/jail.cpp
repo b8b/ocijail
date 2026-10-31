@@ -1,6 +1,7 @@
 #include <sys/param.h>
 
 #include <sys/jail.h>
+#include <sys/sysctl.h>
 #include <cassert>
 #include <iomanip>
 #include <string>
@@ -11,6 +12,16 @@
 #include "ocijail/jail.h"
 
 namespace ocijail {
+
+bool process_is_jailed() {
+    int jailed = 0;
+    std::size_t len = sizeof(jailed);
+    if (::sysctlbyname("security.jail.jailed", &jailed, &len, nullptr, 0) !=
+        0) {
+        return false;
+    }
+    return jailed != 0;
+}
 
 void jail::config::set(const std::string& key, const value& val) {
     // Validate parameter types
