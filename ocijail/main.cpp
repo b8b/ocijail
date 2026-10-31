@@ -2,8 +2,11 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <cstdlib>
 #include <ctime>
+#include <exception>
 #include <iomanip>
+#include <iostream>
 
 #include "ocijail/create.h"
 #include "ocijail/delete.h"
@@ -20,7 +23,35 @@ using nlohmann::json;
 
 static const char* version = "0.7.0-dev";
 
+static int terminate_argc;
+static char** terminate_argv;
+
+// The default handler only prints the exception type, which is not much use
+// when something escapes a destructor or a noexcept function. Print the
+// command line and the exception message instead.
+static void terminate_handler() {
+    std::cerr << "ocijail: terminating:";
+    for (int i = 0; i < terminate_argc; i++) {
+        std::cerr << " " << terminate_argv[i];
+    }
+    std::cerr << "\n";
+    if (auto eptr = std::current_exception(); eptr != nullptr) {
+        try {
+            std::rethrow_exception(eptr);
+        } catch (const std::exception& e) {
+            std::cerr << "ocijail: uncaught exception: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "ocijail: uncaught exception\n";
+        }
+    }
+    std::abort();
+}
+
 int main(int argc, char** argv) {
+    terminate_argc = argc;
+    terminate_argv = argv;
+    std::set_terminate(terminate_handler);
+
     main_app app{"ocijail: Yet another OCI runtime"};
 
     create::init(app);
