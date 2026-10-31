@@ -28,6 +28,8 @@ void unmount_volumes(main_app& app,
                      const nlohmann::json& mounts,
                      std::optional<std::size_t> mounted = std::nullopt);
 
+void unmount_at(main_app& app, const std::filesystem::path& path);
+
 void copy_deferred_file_mounts(main_app& app, runtime_state& state);
 
 }  // namespace ocijail

@@ -4,6 +4,7 @@
 #include <sys/mount.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <cstring>
 #include <iostream>
 #include <optional>
 
@@ -56,6 +57,69 @@ static std::map<std::string, int, std::less<>> name_to_flag = {
     {"nodev", 0},
     {"bind", 0},
 };
+
+// The "FSID:a:b" argument for an MNT_BYFSID unmount of the file system mounted
+// at "path", when the kernel gives us a usable file system id.
+static std::optional<std::string> fsid_at(const fs::path& path) {
+    struct statfs sfs;
+    if (::statfs(path.c_str(), &sfs) != 0) {
+        return std::nullopt;
+    }
+    if (sfs.f_fsid.val[0] == 0 && sfs.f_fsid.val[1] == 0) {
+        // Not available: an old kernel, or a mount this jail cannot see.
+        return std::nullopt;
+    }
+    return "FSID:" + std::to_string(sfs.f_fsid.val[0]) + ":" +
+           std::to_string(sfs.f_fsid.val[1]);
+}
+
+// The file system id to use for an MNT_BYFSID unmount of "path", unless there
+// is no mount there or the kernel does not give us a usable id. Comparing with
+// the parent directory keeps us from unmounting the file system the path merely
+// lives on when the mount we expected was never made (create failed before
+// mounting it, or the mount is already gone).
+static std::optional<std::string> fsid_if_mounted(const fs::path& path) {
+    auto fsid = fsid_at(path);
+    if (!fsid) {
+        return std::nullopt;
+    }
+    auto parent_fsid = fsid_at(path.parent_path());
+    if (parent_fsid && *parent_fsid == *fsid) {
+        return std::nullopt;
+    }
+    return fsid;
+}
+
+// Unmount "path", preferring MNT_BYFSID so that the result does not depend on
+// the path still being reachable - unmounting an outer mount strands the mounts
+// nested inside it, and a nullfs file mount made inside a jail has no path in
+// any namespace at all. Returns 0 on success, otherwise an errno value.
+static int unmount_one(main_app& app,
+                       const fs::path& path,
+                       const std::optional<std::string>& fsid) {
+    if (fsid) {
+        if (::unmount(fsid->c_str(), MNT_FORCE | MNT_BYFSID) == 0) {
+            return 0;
+        }
+        if (errno == ENOENT) {
+            // The mount is gone already.
+            return 0;
+        }
+        app.log_debug() << "unmounting by " << *fsid
+                        << " failed: " << std::strerror(errno) << ", trying "
+                        << path;
+    }
+    if (::unmount(path.c_str(), MNT_FORCE) == 0) {
+        return 0;
+    }
+    return errno;
+}
+
+void unmount_at(main_app& app, const fs::path& path) {
+    if (auto error = unmount_one(app, path, fsid_if_mounted(path))) {
+        app.log() << "unmounting " << path << ": " << std::strerror(error);
+    }
+}
 
 struct pseudo_option {
     pseudo_option(std::string_view type_, std::string_view optkey_)
@@ -543,12 +607,13 @@ static void unmount_volume(main_app& app,
                            bool file_mount_supported,
                            runtime_state& state,
                            const fs::path& root_path,
-                           const json& mount) {
-    auto destination = resolve_container_path(app, root_path, mount);
-
+                           const json& mount,
+                           const std::optional<std::string>& fsid) {
     std::string type = mount.contains("type") ? mount["type"] : "nullfs";
     bool is_file_mount =
         type == "nullfs" && fs::is_regular_file(mount["source"]);
+
+    auto destination = resolve_container_path(app, root_path, mount);
 
     if (is_file_mount && !file_mount_supported) {
         // Restore the saved path if it exists. The copy was made through the
@@ -561,32 +626,34 @@ static void unmount_volume(main_app& app,
         if (fs::exists(save_path)) {
             fs::rename(save_path, restore_destination);
         }
-    } else {
-        if (::unmount(destination.c_str(), MNT_FORCE) < 0) {
-            // unmount returns EINVAL if the kernel cannot find a mount
-            // registered on this path. Normally that just means the mount is
-            // already gone, but it also happens when the mount is real and
-            // simply unreachable by path - the kernel stores a mount point
-            // path that does not match the one we can name. A nullfs file
-            // mount created inside a jail is the known case: vfs_domount()
-            // records it relative to the jail root rather than as a global
-            // path, so no path in any namespace resolves to it and it can
-            // only be removed with "umount -f <fsid>" from the host.
-            //
-            // We cannot tell the two apart here, so carry on with the
-            // teardown but leave a trace, because in the second case we have
-            // just leaked a mount.
-            if (errno == EINVAL) {
-                app.log() << "unmounting " << destination
-                          << ": not a known mount point; if a mount is still "
-                             "present here it has been leaked";
-                return;
-            }
-            throw std::system_error{
-                errno,
-                std::system_category(),
-                "unmounting " + mount["destination"].get<std::string>()};
+        return;
+    }
+
+    if (int error = unmount_one(app, destination, fsid)) {
+        // unmount returns EINVAL if the kernel cannot find a mount
+        // registered on this path. Normally that just means the mount is
+        // already gone, but it also happens when the mount is real and
+        // simply unreachable by path - the kernel stores a mount point
+        // path that does not match the one we can name. A nullfs file
+        // mount created inside a jail is the known case: vfs_domount()
+        // records it relative to the jail root rather than as a global
+        // path, so no path in any namespace resolves to it. If the file
+        // system id was not available either, only "umount -f <fsid>"
+        // from the host can remove it.
+        //
+        // We cannot tell the two apart here, so carry on with the
+        // teardown but leave a trace, because in the other case we have
+        // just leaked a mount.
+        if (error == EINVAL) {
+            app.log() << "unmounting " << destination
+                      << ": not a known mount point; if a mount is still "
+                         "present here it has been leaked";
+            return;
         }
+        throw std::system_error{
+            error,
+            std::system_category(),
+            "unmounting " + mount["destination"].get<std::string>()};
     }
 }
 
@@ -643,6 +710,19 @@ void unmount_volumes(main_app& app,
     // the whole list, which is what delete wants.
     auto count = mounted.value_or(mounts.size());
 
+    // Collect the file system ids before unmounting anything. Unmounting an
+    // outer mount strands the mounts nested inside it, after which no path
+    // resolves to them, and MNT_BYFSID is the only way left to remove them.
+    std::vector<std::optional<std::string>> fsids(count);
+    for (std::size_t i = 0; i < count; i++) {
+        try {
+            fsids[i] = fsid_if_mounted(
+                resolve_container_path(app, root_path, mounts[i]));
+        } catch (const std::exception&) {
+            // Fall back to unmounting by path.
+        }
+    }
+
     // Remember the first exception (if any) but try to unmount
     // everything.
     //
@@ -651,12 +731,16 @@ void unmount_volumes(main_app& app,
     // down before the one it sits inside. Unmounting the outer one first does
     // not fail: MNT_FORCE tears it down anyway and strands the inner mount on
     // a covered vnode whose filesystem is gone, after which it has no path in
-    // any namespace and only "umount -f <fsid>" from the host can remove it.
+    // any namespace and only "umount -f <fsid>" can remove it.
     std::exception_ptr eptr{nullptr};
     for (std::size_t i = count; i > 0; i--) {
         try {
-            unmount_volume(
-                app, file_mount_supported, state, root_path, mounts[i - 1]);
+            unmount_volume(app,
+                           file_mount_supported,
+                           state,
+                           root_path,
+                           mounts[i - 1],
+                           fsids[i - 1]);
         } catch (const std::exception&) {
             if (!eptr) {
                 eptr = std::current_exception();
